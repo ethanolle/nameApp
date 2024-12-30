@@ -2,10 +2,12 @@ import express from 'express';
 import { Logger } from '@mondaycom/apps-sdk';
 import { transformText } from './src/transformation-service.js';
 import { authorizeRequest } from './src/middleware.js';
-import { changeColumnValue, getColumnValue, fetchBoardColumns, fetchColumnValues, updateItemName } from './src/monday-api-service.js';
+import { changeColumnValue, getColumnValue } from './src/monday-api-service.js';
 import { getSecret, isDevelopmentEnv, getEnv } from './src/helpers.js';
+import { processMessages, produceMessage } from './src/queue-service.js';
+import validator from 'validator';
 import dotenv from 'dotenv';
-import { readQueueMessage, produceMessage } from './src/queue-service.js';
+
 dotenv.config();
 
 const logTag = 'ExpressServer';
@@ -15,16 +17,18 @@ const TO_UPPER_CASE = 'TO_UPPER_CASE';
 const TO_LOWER_CASE = 'TO_LOWER_CASE';
 
 const logger = new Logger(logTag);
-const currentPort = getSecret(PORT); // Port must be 8080 to work with monday code
+const currentPort = getSecret(PORT);
 const currentUrl = getSecret(SERVICE_TAG_URL);
 
 const app = express();
 app.use(express.json());
 
+// Basic health check
 app.get('/', (req, res) => {
   res.status(200).send({ message: 'healthy' });
 });
 
+// Text transformation endpoint
 app.post('/monday/execute_action', authorizeRequest, async (req, res) => {
   logger.info(
     JSON.stringify({
@@ -34,80 +38,102 @@ app.post('/monday/execute_action', authorizeRequest, async (req, res) => {
       headers: req.headers,
     }),
   );
-  const { shortLivedToken } = req.session;
-  const { payload } = req.body;
 
   try {
+    const { shortLivedToken } = req.session;
+    const { payload } = req.body;
     const { inputFields } = payload;
-    const { boardId, itemId, sourceColumnId, targetColumnId, transformationType } = inputFields;
+    const { boardId, itemId, sourceColumnId, targetColumnId } = inputFields;
 
     const text = await getColumnValue(shortLivedToken, itemId, sourceColumnId);
     if (!text) {
-      return res.status(200).send({});
+      return res.status(200).json({
+        success: true,
+      });
     }
-    const transformedText = transformText(text, transformationType ? transformationType.value : 'TO_UPPER_CASE');
 
+    const transformationTypeValue = inputFields.transformationType && inputFields.transformationType.value;
+    const transformedText = transformText(text, transformationTypeValue || 'TO_UPPER_CASE');
     await changeColumnValue(shortLivedToken, boardId, itemId, targetColumnId, transformedText);
 
-    return res.status(200).send({});
-  } catch (err) {
-    logger.error(err);
-    return res.status(500).send({ message: 'internal server error' });
-  }
-});
-
-app.post('/monday/execute_action_item_name', authorizeRequest, async (req, res) => {
-  logger.info(
-    JSON.stringify({
-      message: 'New request received',
-      path: '/action',
-      body: req.body,
-      headers: req.headers,
-    }),
-  );
-  const { shortLivedToken } = req.session;
-  const { payload } = req.body;
-
-  try {
-    const { inputFields } = payload;
-    const { boardId, itemId, text } = inputFields;
-    const columnNames = text.split(',').map((name) => name.trim());
-
-    // Fetch board columns with type and settings
-    const { boardColumns, mondayClient } = await fetchBoardColumns(shortLivedToken, boardId);
-    const columnNameToIdMap = {};
-    boardColumns.forEach((column) => {
-      columnNameToIdMap[column.title] = column.id;
+    return res.status(200).json({
+      success: true,
     });
-    const columnIds = columnNames.map((name) => columnNameToIdMap[name]);
-    const undefinedColumns = columnNames.filter((name, index) => !columnIds[index]);
-    if (undefinedColumns.length > 0) {
-      logger.error(`Columns not found: ${undefinedColumns.join(', ')}`);
-      return res.status(400).send({ message: `Columns not found: ${undefinedColumns.join(', ')}` });
-    }
-
-    // Get the column values for the item, handling mirror columns
-    const columnValues = await fetchColumnValues(itemId, columnIds, mondayClient, boardColumns);
-
-    // Build the new item name
-    const columnValueTexts = columnValues.map((columnValue) => columnValue.text);
-    const newItemName = columnValueTexts.join(' - ');
-
-    // Change the item's name
-    await updateItemName(itemId, boardId, newItemName, mondayClient);
-
-    return res.status(200).send({});
   } catch (err) {
     logger.error(err);
-    return res.status(500).send({ message: 'internal server error' });
+    return res.status(500).json({
+      success: false,
+      severityCode: 4000,
+      notificationErrorTitle: 'Text Transformation Failed',
+      notificationErrorDescription: 'Failed to transform the text. Please check the column values and try again.',
+      runtimeErrorDescription: 'Error occurred during text transformation action.',
+    });
   }
 });
 
+// Item name update endpoint
+app.post('/monday/execute_action_item_name', authorizeRequest, async (req, res) => {
+  try {
+    const { shortLivedToken } = req.session;
+    const { payload } = req.body;
+    const { inputFields } = payload;
+
+    const messagePayload = {
+      shortLivedToken,
+      inputFields: {
+        boardId: inputFields.boardId.toString(),
+        itemId: inputFields.itemId.toString(),
+        text: inputFields.text.toString(),
+      },
+      metadata: {
+        timestamp: Date.now(),
+        retryCount: 0,
+      },
+    };
+
+    try {
+      const timestamp = await produceMessage(JSON.stringify(messagePayload));
+
+      // Return success response in Monday.com's expected format
+      return res.status(200).json({
+        success: true,
+        data: {
+          timestamp,
+          itemId: inputFields.itemId,
+          boardId: inputFields.boardId,
+        },
+      });
+    } catch (produceError) {
+      logger.error('Failed to produce message:', produceError);
+      // Return medium severity error
+      return res.status(422).json({
+        success: false,
+        severityCode: 4000,
+        notificationErrorTitle: 'Failed to Queue Action',
+        notificationErrorDescription: 'Unable to process the item name update at this time. Please try again.',
+        runtimeErrorDescription: 'Failed to queue the item name update action in the message queue.',
+      });
+    }
+  } catch (err) {
+    logger.error('Error in execute_action_item_name:', err);
+    // Return high severity error
+    return res.status(500).json({
+      success: false,
+      severityCode: 6000,
+      notificationErrorTitle: 'System Error',
+      notificationErrorDescription: 'A critical error occurred while processing your request. Please contact support.',
+      runtimeErrorDescription: 'Internal server error while processing item name update action.',
+    });
+  }
+});
+
+// Get transformation options endpoint
 app.post('/monday/get_remote_list_options', authorizeRequest, async (req, res) => {
   const TRANSFORMATION_TYPES = [
     { title: 'to upper case', value: TO_UPPER_CASE },
     { title: 'to lower case', value: TO_LOWER_CASE },
   ];
+
   try {
     return res.status(200).send(TRANSFORMATION_TYPES);
   } catch (err) {
@@ -116,10 +142,10 @@ app.post('/monday/get_remote_list_options', authorizeRequest, async (req, res) =
   }
 });
 
+// Test endpoint for producing messages directly
 app.post('/produce', async (req, res) => {
   try {
-    const { body } = req;
-    const message = JSON.stringify(body);
+    const message = JSON.stringify(req.body);
     const messageId = await produceMessage(message);
     return res.status(200).send({ messageId });
   } catch (err) {
@@ -128,17 +154,10 @@ app.post('/produce', async (req, res) => {
   }
 });
 
-app.post('/mndy-queue', async (req, res) => {
-  try {
-    const { body, query } = req;
-    readQueueMessage({ body, query });
-    return res.status(200).send({}); // return 200 to ACK the queue message
-  } catch (err) {
-    logger.error(err.error);
-    return res.status(500).send({ message: 'internal server error' });
-  }
-});
+// Start message processing
+processMessages();
 
+// Start server
 app.listen(currentPort, () => {
   if (isDevelopmentEnv()) {
     logger.info(`app running locally on port ${currentPort}`);
