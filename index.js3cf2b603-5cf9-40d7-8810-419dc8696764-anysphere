@@ -1,0 +1,2 @@
+// Setup processors for all queues
+queues.forEach((queue, index) => setupQueueProcessor(queue, index)); 

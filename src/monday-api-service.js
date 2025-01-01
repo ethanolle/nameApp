@@ -26,6 +26,43 @@ export const getColumnValue = async (token, itemId, columnId) => {
   }
 };
 
+export const calculateIsToComplex = async (jobData) => {
+  const { payload } = jobData;
+  try {
+    // setup the tokens
+    const mondayClient = initMondayClient({ token: payload.shortLivedToken });
+    mondayClient.setApiVersion('2024-01');
+    // Check complexity before proceeding
+    const complexityQuery = `query {
+      complexity {
+        before
+        query 
+        after
+      }
+    }`;
+
+    const complexityResult = await mondayClient.api(complexityQuery);
+
+    if (complexityResult.errors) {
+      throw new Error(`Failed to fetch complexity: ${complexityResult.errors}`);
+    }
+    const { before, query: queryComplexity } = complexityResult.data.complexity;
+
+    if (before < 1000000 || queryComplexity > 5000000) {
+      logger.warn('Complexity limits approaching threshold', {
+        remainingComplexity: before,
+        queryComplexity,
+      });
+      return true; // Signal that processing should be delayed
+    }
+
+    return false; // Safe to proceed with processing
+  } catch (err) {
+    logger.error(err);
+    throw err;
+  }
+};
+
 export const changeColumnValue = async (token, boardId, itemId, columnId, value) => {
   try {
     const mondayClient = initMondayClient({ token });
@@ -106,45 +143,34 @@ export async function fetchColumnValues(itemId, columnIds, mondayClient) {
 
 // Helper function to fetch board columns with types and settings
 export async function fetchBoardColumns(shortLivedToken, boardId) {
-  const maxRetries = 3;
-  const retryDelays = [15000, 30000, 60000]; // 15s, 30s, 1min
+  try {
+    const mondayClient = initMondayClient();
+    mondayClient.setApiVersion('2024-01');
+    mondayClient.setToken(shortLivedToken);
 
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    try {
-      const mondayClient = initMondayClient();
-      mondayClient.setApiVersion('2024-01');
-      mondayClient.setToken(shortLivedToken);
-
-      // Get columns of the board
-      const columnsQuery = `
-        query ($boardId: [ID!]) {
-          boards(ids: $boardId) {
-            columns {
-              id
-              title
-              type
-              settings_str
-            }
+    // Get columns of the board
+    const columnsQuery = `
+      query ($boardId: [ID!]) {
+        boards(ids: $boardId) {
+          columns {
+            id
+            title
+            type
+            settings_str
           }
         }
-      `;
-      const columnsVariables = { boardId };
-      const columnsResponse = await mondayClient.api(columnsQuery, { variables: columnsVariables });
-      const boardColumns = columnsResponse.data.boards[0].columns;
-
-      return { boardColumns, mondayClient };
-    } catch (err) {
-      logger.error(`Attempt ${attempt + 1} failed: ${err.message}`);
-
-      // If this is the last attempt, throw the error
-      if (attempt === maxRetries - 1) {
-        throw new Error(`Failed to fetch board columns after ${maxRetries} attempts: ${err.message}`);
       }
-
-      // Wait for the configured delay before next retry
-      const delay = retryDelays[attempt];
-      logger.info(`Waiting ${delay}ms before retry ${attempt + 2}/${maxRetries}`);
-      await new Promise((resolve) => setTimeout(resolve, delay));
+    `;
+    const columnsVariables = { boardId };
+    const columnsResponse = await mondayClient.api(columnsQuery, { variables: columnsVariables });
+    if (columnsResponse.errors) {
+      throw new Error(`Failed to fetch board columns: ${columnsResponse.errors}`);
     }
+    const boardColumns = columnsResponse.data.boards[0].columns;
+
+    return { boardColumns, mondayClient };
+  } catch (err) {
+    logger.error(`Failed to fetch board columns: ${err.message}`);
+    throw new Error(`Failed to fetch board columns: ${err.message}`);
   }
 }

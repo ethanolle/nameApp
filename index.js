@@ -4,8 +4,7 @@ import { transformText } from './src/transformation-service.js';
 import { authorizeRequest } from './src/middleware.js';
 import { changeColumnValue, getColumnValue } from './src/monday-api-service.js';
 import { getSecret, isDevelopmentEnv, getEnv } from './src/helpers.js';
-import { processMessages, produceMessage } from './src/queue-service.js';
-import validator from 'validator';
+import { addToQueue } from './src/bull-queue-service.js';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -79,32 +78,35 @@ app.post('/monday/execute_action_item_name', authorizeRequest, async (req, res) 
     const { inputFields } = payload;
 
     const messagePayload = {
-      shortLivedToken,
-      inputFields: {
-        boardId: inputFields.boardId.toString(),
-        itemId: inputFields.itemId.toString(),
-        text: inputFields.text.toString(),
+      payload: {
+        shortLivedToken,
+        inputFields: {
+          boardId: inputFields.boardId.toString(),
+          itemId: inputFields.itemId.toString(),
+          text: inputFields.text.toString(),
+        },
       },
       metadata: {
         timestamp: Date.now(),
         retryCount: 0,
+        actId: req.session.accountId, // Add account ID for rate limiting
       },
     };
 
     try {
-      const timestamp = await produceMessage(JSON.stringify(messagePayload));
+      const jobId = await addToQueue(messagePayload);
 
       // Return success response in Monday.com's expected format
       return res.status(200).json({
         success: true,
         data: {
-          timestamp,
+          jobId,
           itemId: inputFields.itemId,
           boardId: inputFields.boardId,
         },
       });
     } catch (produceError) {
-      logger.error('Failed to produce message:', produceError);
+      logger.error('Failed to add message to queue:', produceError);
       // Return medium severity error
       return res.status(422).json({
         success: false,
@@ -145,8 +147,14 @@ app.post('/monday/get_remote_list_options', authorizeRequest, async (req, res) =
 // Test endpoint for producing messages directly
 app.post('/produce', async (req, res) => {
   try {
-    const message = JSON.stringify(req.body);
-    const messageId = await produceMessage(message);
+    const messageId = await addToQueue({
+      payload: req.body,
+      metadata: {
+        timestamp: Date.now(),
+        retryCount: 0,
+        actId: req.body.actId || 'test-account', // For testing purposes
+      },
+    });
     return res.status(200).send({ messageId });
   } catch (err) {
     logger.error(JSON.stringify(err));
@@ -154,8 +162,7 @@ app.post('/produce', async (req, res) => {
   }
 });
 
-// Start message processing
-processMessages();
+// Note: Queue processors are automatically initialized in bull-queue-service.js
 
 // Start server
 app.listen(currentPort, () => {
